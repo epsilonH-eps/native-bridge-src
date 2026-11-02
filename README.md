@@ -1,198 +1,197 @@
-# Stellaris MCP Bridge
+# Stellaris MCP Bridge（中文）
 
-[![English](https://img.shields.io/badge/lang-English-blue.svg)](#)
-[![Chinese](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red.svg)](./README.zh-CN.md)
+[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-red.svg)](#)
+[![English](https://img.shields.io/badge/lang-English-blue.svg)](./README.en.md)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-`stellaris-mcp` is a native game bridge and Model Context Protocol (MCP) server for **Stellaris** (群星). It enables AI agents (Claude Desktop, Cursor, Antigravity, etc.) and reinforcement learning frameworks to perceive, analyze, and play Stellaris with native determinism, zero OCR latency, and full thread safety.
+> 本仓库是 `stellaris-mcp-native` 的**源码快照**，用于在本地重新编译「群星链接器」使用的
+> `stellaris_bridge.dll`（cyberfish 版）。快照用途与编译依赖见 [NOTE.md](./NOTE.md)；
+> 英文原文见 [README.en.md](./README.en.md)。下面是上游项目自己的中文说明。
+
+`stellaris-mcp` 是专为 Paradox Interactive 的大战略游戏 **《群星》（Stellaris）** 打造的原生底层注入桥接与模型上下文协议（Model Context Protocol, MCP）服务。它支持大语言模型与自主智能体（Claude Desktop、Cursor、Antigravity 等）通过原生确定性内存接口对《群星》进行实时状态感知、全局决策与游戏控制，杜绝传统 OCR 方案的高延迟与幻觉。
 
 > [!WARNING]
-> This is an unofficial research and agentic gaming project. It is not affiliated with or endorsed by Paradox Interactive. The Bridge operates via in-process DLL injection into `stellaris.exe` on Windows. Always back up your save files before use.
+> 本项目为非官方开源研究项目，与 Paradox Interactive 无任何隶属或背书关系。Bridge 通过在 Windows 上向 `stellaris.exe` 进程注入 DLL 进行工作。使用前请务必备份游戏存档。
 
 ---
 
-## Architecture Overview
+## 核心架构
 
 ```mermaid
 flowchart LR
-    subgraph Agent Layer
-        C[MCP Client<br/>Claude Desktop / Cursor / AGY]
+    subgraph Agent Layer [智能体层]
+        C[MCP 客户端<br/>Claude Desktop / Cursor / AGY]
     end
 
-    subgraph MCP Server Layer
-        S[TypeScript MCP Server<br/>stdio transport]
-        P[Named Pipe Client<br/>IPC Client]
+    subgraph MCP Server Layer [协议服务层]
+        S[TypeScript MCP 服务<br/>stdio 传输]
+        P[Named Pipe 客户端<br/>IPC 进程间通信]
         S <--> P
     end
 
-    subgraph Native Bridge Layer
+    subgraph Native Bridge Layer [原生注入桥]
         N[stellaris_bridge.dll]
         H[DXGI SwapChain Hook<br/>MinHook]
-        Q[Main-Thread Task Queue]
-        I[Named Pipe IPC Server<br/>stellaris_bridge_pipe]
-        M[Domain Managers<br/>Tech / Fleets / Leaders / etc.]
+        Q[主线程任务队列 TaskQueue]
+        I[命名管道服务端<br/>stellaris_bridge_pipe]
+        M[业务领域管理器<br/>科研 / 舰队 / 领袖 / 物种 等]
     end
 
-    subgraph Game Process
-        G[Stellaris Engine<br/>stellaris.exe]
+    subgraph Game Process [游戏进程]
+        G[群星引擎<br/>stellaris.exe]
     end
 
     C <-->|JSON-RPC 2.0 / stdio| S
     P <-->|Windows Named Pipe| I
-    I -->|Enqueues Task| Q
-    H -->|Frame Render Tick| Q
-    Q -->|Executes on Main Thread| M
-    M <-->|Direct Memory & Commands| G
+    I -->|入队任务| Q
+    H -->|DXGI 渲染帧调用| Q
+    Q -->|主线程安全执行| M
+    M <-->|直接内存读写与命令派发| G
 ```
 
-The system is engineered around three primary design requirements:
-1. **Thread Safety & Stability**: Stellaris is not thread-safe for external memory manipulation. The bridge hooks `IDXGISwapChain::Present` via [MinHook](https://github.com/TsudaKageyu/minhook). State queries and command dispatches are enqueued into a thread-safe `TaskQueue` and processed exclusively on the engine's main rendering thread.
-2. **Deterministic Native Commands**: Game actions are never simulated through clumsy mouse/keyboard clicks. Instead, they are instantiated as native Clauswitz engine command objects (`CPauseCommand`, `CSelectResearchCommand`, `CHireLeaderCommand`, `CReinforceFleetCommand`, etc.) and dispatched through the engine's internal command processor.
-3. **Progressive Disclosure Architecture**: To prevent context window bloat and token exhaustion, game observation is structured into 3 distinct layers:
-   - **Layer 1: Global Perception (`stellaris_get_status`)**: Compact, high-density snapshot covering date, simulation speed, pause state, empire capacity, all 26 resource flows, and summary indicators.
-   - **Layer 2: Domain Deep-Dive**: Targeted read tools invoked only when relevant (e.g., query tech choices only when research is idle, query species rights only when managing populations).
-   - **Layer 3: Native Action Execution**: Fine-grained, validated mutations that affect the simulation state.
+系统围绕三大第一性原理工程规范进行设计：
+1. **主线程安全与零崩溃**：《群星》引擎并非线程安全。Bridge 通过 [MinHook](https://github.com/TsudaKageyu/minhook) 挂载 `IDXGISwapChain::Present` 渲染钩子。所有跨进程 IPC 请求全部提交至线程安全 `TaskQueue`，严格在引擎主渲染循环的上下文内执行，彻底杜绝多线程竞争导致的内存崩溃。
+2. **确定性原生引擎指令（Zero-Hallucination Actions）**：拒绝模拟键鼠点击。所有修改游戏状态的动作直接实例化引擎内部原生指令对象（如 `CPauseCommand`、`CSelectResearchCommand`、`CHireLeaderCommand`、`CReinforceFleetCommand`、`CSetSpeciesRightCommand` 等），通过游戏引擎命令总线派发执行。
+3. **渐进式披露架构（Progressive Disclosure）**：为避免大模型上下文窗口膨胀和 Token 浪费，设计三层感知与控制：
+   - **第一层：全局宏观感知（Global Perception - `stellaris_get_status`）**：低 Token 开销的高信息密度快照，包括游戏日期、流速、暂停状态、帝国规模、舰队/星区容量、全部 26 种资源收支指标以及各子系统概要。
+   - **第二层：领域按需下钻（Domain Deep-Dive）**：仅在需要时调用的专项查询工具（如在科研空闲时查科技库，在领袖空缺时查候选池，在物种政策调整时查权力矩阵）。
+   - **第三层：原子操作执行（Native Action Execution）**：精准执行引擎状态突变指令。
 
 ---
 
-## Tool Catalog (29 Tools)
+## 工具目录（共 29 个工具）
 
-### Layer 1: Global Perception
+### 第一层：全局宏观感知
 
-| Tool | Parameters | Description |
+| 工具名 | 参数 | 功能说明 |
 |---|---|---|
-| `stellaris_get_status` | *(none)* | Global empire overview: date, pause state, speed (0-4), 26 resource stockpiles & net incomes, empire size, fleet/starbase capacities, and subsystem alert counters. |
+| `stellaris_get_status` | *(无)* | 获取帝国全局状态快照：游戏日期、暂停状态、模拟速度（0-4）、26 种资源储量与净收支、帝国规模、舰队与恒星基地容量、以及情势/议程/传统/领袖等红点指示器。 |
 
-### Layer 2: Domain Queries
+### 第二层：领域按需查询
 
-| Tool | Parameters | Description |
+| 工具名 | 参数 | 功能说明 |
 |---|---|---|
-| `stellaris_get_active_events` | *(none)* | Retrieves all pending event windows, including event IDs, titles, descriptions, and option choices with validity flags. |
-| `stellaris_get_notifications` | *(none)* | Retrieves active top-bar message notifications queue (badges awaiting acknowledgment). |
-| `stellaris_get_alerts` | *(none)* | Retrieves active top-bar alert banners (`CAlertIconsWindow`), alert IDs (0..65), titles, and tooltips. |
-| `stellaris_get_research_state` | *(none)* | Retrieves current research progress, active tech, and available research options across Physics, Society, and Engineering. |
-| `stellaris_get_situation_log` | *(none)* | Retrieves active situations (progress, stages, approaches), special projects, and scanned anomalies. |
-| `stellaris_get_government` | *(none)* | Retrieves government form, authority, ethics, active civics, council slots/members, and active agenda progress. |
-| `stellaris_get_traditions` | *(none)* | Retrieves adopted tradition trees, unlocked perks, available tradition slots, and adoptable trees. |
-| `stellaris_get_edicts` | *(none)* | Retrieves active and available edicts, current edict fund, and unity upkeep. |
-| `stellaris_get_leaders` | *(none)* | Retrieves hired leaders and current recruitment pool, including classes, levels, traits, and current assignments. |
-| `stellaris_get_species` | `mode` (`"empire"` \| `"galaxy"`), `species_id` *(optional)* | Retrieves species portraits, traits, pop counts, and current 9-category rights configurations alongside the available rights catalog. |
-| `stellaris_get_fleets` | `fleet_id` *(optional)*, `include_civilian` *(optional)* | Retrieves detailed fleet breakdowns: military power, ship designs, current counts, template target quotas, and reinforcement deficits. |
+| `stellaris_get_active_events` | *(无)* | 查询当前弹出的所有待处理事件窗口、事件文本、标题及各分支选项的有效性状态。 |
+| `stellaris_get_notifications` | *(无)* | 查询顶部通知队列（待点击处理的消息徽标）。 |
+| `stellaris_get_alerts` | *(无)* | 查询顶部预警横幅（`CAlertIconsWindow`，Alert ID 0..65）、预警标题与悬浮提示。 |
+| `stellaris_get_research_state` | *(无)* | 查询物理学、社会学、工程学三大科研槽位的在研科技、研发进度及当前可抽选的研究选项。 |
+| `stellaris_get_situation_log` | *(无)* | 查询情势记录（Situation Log）：正在发生的情势阶段与对策、特殊项目以及已扫描的异常点。 |
+| `stellaris_get_government` | *(无)* | 查询政体形式、权威、思潮、国策、内阁席位人选及当前议程准备进度。 |
+| `stellaris_get_traditions` | *(无)* | 查询已开传统树、已解锁传统专精、可用槽位及当前可选传统。 |
+| `stellaris_get_edicts` | *(无)* | 查询所有可用法令、激活状态、法令基金额度及凝聚力维护费。 |
+| `stellaris_get_leaders` | *(无)* | 查询在职领袖与待招募候选池（领袖类别、等级、正负面特质、任命位置等）。 |
+| `stellaris_get_species` | `mode`（`"empire"` \| `"galaxy"`），`species_id` *(可选)* | 查询帝国或全银河物种肖像、特质、人口数量及 9 大权力类别配置矩阵（公民权、生活标准、净化等）。 |
+| `stellaris_get_fleets` | `fleet_id` *(可选)*，`include_civilian` *(可选)* | 查询舰队详情：战斗力预估、舰船设计明细、现有编制、模版配额及增援缺额状态。 |
 
-### Layer 3: Native Action Execution
+### 第三层：原生操作执行
 
-| Tool | Parameters | Description |
+| 工具名 | 参数 | 功能说明 |
 |---|---|---|
-| `stellaris_set_paused` | `paused: boolean` | Deterministically pauses or resumes the game simulation via native `CPauseCommand`. |
-| `stellaris_set_speed` | `speed: 0..4` | Sets simulation speed (0: Slowest, 1: Slow, 2: Normal, 3: Fast, 4: Very Fast). |
-| `stellaris_resolve_event` | `window_id: int`, `option_index: int` | Selects an option choice for a modal event window and dismisses the dialog. |
-| `stellaris_open_notification` | `index: int` | Triggers a left-click on a top-bar notification badge to open its associated modal. |
-| `stellaris_open_alert` | `alert_id: int` | Triggers a click on a top-bar alert banner to open its corresponding subsystem view. |
-| `stellaris_select_research` | `slot: string`, `tech_key: string` | Assigns a technology to research via native `CSelectResearchCommand`. |
-| `stellaris_cancel_research` | `slot: string` | Cancels current technology research in the specified physics/society/engineering slot. |
-| `stellaris_set_situation_approach` | `situation_id: int`, `approach_index: int` | Modifies the approach/stance for an active situation via `CSetSituationApproachCommand`. |
-| `stellaris_launch_council_agenda` | `agenda_key: string` | Launches or activates a council agenda via native agenda commands. |
-| `stellaris_adopt_tradition` | `tradition_key: string` | Adopts a new tradition tree or unlocks a tradition perk via `CAdoptTraditionCommand`. |
-| `stellaris_toggle_edict` | `edict_key: string`, `enabled: boolean` | Toggles an imperial edict on or off via native `CToggleEdictCommand`. |
-| `stellaris_hire_leader` | `candidate_id: int` | Recruits a leader candidate from the active pool via `CHireLeaderCommand`. |
-| `stellaris_dismiss_leader` | `leader_id: int` | Dismisses a hired leader from the empire via `CDismissLeaderCommand`. |
-| `stellaris_assign_leader` | `leader_id: int`, `slot_type: string`, `target_id: int` | Assigns a leader to a council seat, fleet, planet, or army via `CAssignLeaderCommand`. |
-| `stellaris_set_species_rights` | `species_id: int`, `category: string`, `right_value: string` | Configures species rights (citizenship, living standards, military service, slavery, purge, etc.) via `CSetSpeciesRightCommand`. |
-| `stellaris_reinforce_fleet` | `fleet_id: int` | Dispatches shipbuilding orders to available shipyards to fulfill fleet template deficits via `CReinforceFleetCommand`. |
-| `stellaris_set_fleet_template_quota` | `fleet_id: int`, `design_id: int`, `target_quota: int` | Modifies the target quota for a ship design within a fleet template (`CFleetTemplate::AddDesign`). |
+| `stellaris_set_paused` | `paused: boolean` | 通过引擎原生 `CPauseCommand` 确定性暂停或恢复游戏模拟。 |
+| `stellaris_set_speed` | `speed: 0..4` | 设置游戏流速（0: 最慢, 1: 慢, 2: 正常, 3: 快, 4: 极快）。 |
+| `stellaris_resolve_event` | `window_id: int`, `option_index: int` | 依据窗口 ID 与选项下标选择事件分支并自动关闭事件弹窗。 |
+| `stellaris_open_notification` | `index: int` | 点击顶部通知队列中的消息徽标，将其展开为交互事件或异常视图。 |
+| `stellaris_open_alert` | `alert_id: int` | 点击顶部预警图标打开对应界面视图。 |
+| `stellaris_select_research` | `slot: string`, `tech_key: string` | 通过原生 `CSelectResearchCommand` 为指定科研槽位指派研发科技。 |
+| `stellaris_cancel_research` | `slot: string` | 取消指定槽位当前正在研发的科技。 |
+| `stellaris_set_situation_approach` | `situation_id: int`, `approach_index: int` | 通过 `CSetSituationApproachCommand` 调整进行中情势的应对策略分支。 |
+| `stellaris_launch_council_agenda` | `agenda_key: string` | 启动或激活指定的内阁议程。 |
+| `stellaris_adopt_tradition` | `tradition_key: string` | 通过 `CAdoptTraditionCommand` 采纳新传统树或点出传统分支。 |
+| `stellaris_toggle_edict` | `edict_key: string`, `enabled: boolean` | 通过 `CToggleEdictCommand` 开启或关闭帝国法令。 |
+| `stellaris_hire_leader` | `candidate_id: int` | 通过 `CHireLeaderCommand` 从招募池雇佣指定领袖。 |
+| `stellaris_dismiss_leader` | `leader_id: int` | 通过 `CDismissLeaderCommand` 解雇指定领袖。 |
+| `stellaris_assign_leader` | `leader_id: int`, `slot_type: string`, `target_id: int` | 通过 `CAssignLeaderCommand` 任命领袖到内阁席位、舰队、科研船、行星或军团。 |
+| `stellaris_set_species_rights` | `species_id: int`, `category: string`, `right_value: string` | 通过 `CSetSpeciesRightCommand` 修改物种权力（公民权、生活水平、军事服役、迁徙等）。 |
+| `stellaris_reinforce_fleet` | `fleet_id: int` | 通过 `CReinforceFleetCommand` 向可用造船厂一键下达补满模版缺额的增援订单。 |
+| `stellaris_set_fleet_template_quota` | `fleet_id: int`, `design_id: int`, `target_quota: int` | 原生修改舰队模版（`CFleetTemplate`）内指定舰船型号的目标配额。 |
 
 ---
 
-## Project Structure
+## 仓库结构
 
 ```
 stellarismcp/
-├── CMakeLists.txt              # Root CMake build configuration
-├── stellaris_bridge/           # Native C++ DLL (MinHook + IPC + Game State)
+├── CMakeLists.txt              # 根 CMake 构建配置
+├── stellaris_bridge/           # 原生 C++ 动态链接库（MinHook + 命名管道 + 内存业务）
 │   ├── CMakeLists.txt
-│   ├── include/                # Header definitions & manager interfaces
-│   └── src/                    # Hook manager, IPC server, command dispatchers
-├── plugin/                     # Launcher plugin manifest, default settings, plugin README
-├── stellaris_mcp_server/       # TypeScript MCP Server (Node.js SDK)
+│   ├── include/                # 头文件定义与管理器接口
+│   └── src/                    # 钩子挂载、IPC 服务端、命令派发器
+├── plugin/                     # 启动器插件清单、默认设置、插件说明
+├── stellaris_mcp_server/       # TypeScript MCP 服务端（Node.js SDK）
 │   ├── package.json
 │   ├── tsconfig.json
 │   └── src/
-│       ├── index.ts            # Entrypoint & stdio transport setup
-│       ├── pipe_client.ts      # Named Pipe IPC client
-│       └── tools.ts            # MCP tool registrations (29 tools)
-├── scripts/                    # Automation, injection, and reverse-engineering tools
-│   ├── build.ps1               # Automated MSVC Release build script
-│   ├── make_plugin.py          # Assembles the launcher plugin folder / release zip
-│   ├── reload_dll.py           # Development: re-inject a fresh build into the running game
-│   └── ...                     # Memory exploration & verification scripts
+│       ├── index.ts            # 服务入口与 stdio 传输
+│       ├── pipe_client.ts      # Windows 命名管道客户端
+│       └── tools.ts            # 29 个 MCP 工具的具体注册与类型校验
+├── scripts/                    # 编译、注入与逆向工程辅助脚本
+│   ├── build.ps1               # MSVC Release 自动化构建脚本
+│   ├── make_plugin.py          # 组装启动器插件目录 / 发布 zip
+│   ├── reload_dll.py           # 开发用：把新构建的 DLL 重新注入运行中的游戏
+│   └── ...                     # 内存探测与全链路验证脚本
 └── README.md
 ```
 
 ---
 
-## Prerequisites
+## 环境要求
 
-- **Operating System**: Windows 10 / 11 (x64)
-- **Game**: Stellaris (x64 Windows executable)
-- **Compiler**: Visual Studio 2022 (with "Desktop development with C++") & CMake 3.20+
-- **Runtime**: Node.js (v18.0.0 or newer)
-- **Scripting**: Python 3.10+ (with `ctypes` support)
+- **操作系统**：Windows 10 / 11 (x64)
+- **游戏客户端**：正版《群星》（Stellaris x64 Windows 客户端）
+- **编译工具链**：Visual Studio 2022（需安装“使用 C++ 的桌面开发”工作负载）及 CMake 3.20+
+- **运行环境**：Node.js (v18.0.0 或更高版本)
+- **脚本环境**：Python 3.10+ (需支持 `ctypes`)
 
 ---
 
-## Getting Started
+## 快速上手
 
-The bridge is a **Stellaris launcher plugin** (DLL plugin spec v2 of the
-[Stellaris launcher](https://github.com/Yidhar/stellaris-Launcher), `stl`). The launcher installs it, checks it against
-the installed game build, and loads it into the game. Nothing goes into the game folder, and starting the game from Steam
-or the Paradox Launcher starts it without the bridge.
+Bridge 是 **Stellaris 启动器插件**（[Stellaris 启动器](https://github.com/Yidhar/stellaris-Launcher) `stl` 的 DLL 插件规范 v2）。
+由启动器安装、核对游戏版本并加载进游戏；游戏目录里不放任何文件。从 Steam 或 Paradox 启动器启动游戏时不会加载插件。
 
-### 1. Install a release
+### 1. 安装发布版
 
-1. Download `stellaris-mcp-<version>.zip` from the releases. Its files are the plugin folder itself.
-2. Install it with the launcher's Plugins page (*Install plugin*), or unpack it into
-   `Documents\Paradox Interactive\Stellaris\plugins\stellaris-mcp\`.
-3. Enable it in your playset (`stl plugin enable stellaris-mcp`) and start the game with `stl launch` or the Play button.
-4. Install the MCP server's dependencies once: run `mcp-server\install.cmd` in the plugin folder (Node.js 20+; it runs
-   `npm ci --omit=dev` from the lockfile). They are not shipped; run it again after updating the plugin.
-5. Register the MCP server in the plugin folder (`mcp-server\dist\index.js`) with your client, see below.
+1. 从 Releases 下载 `stellaris-mcp-<版本>.zip`，压缩包里的文件就是插件目录本身。
+2. 用启动器插件页的「安装插件」安装，或解压到 `文档\Paradox Interactive\Stellaris\plugins\stellaris-mcp\`。
+3. 在游戏配置里启用（`stl plugin enable stellaris-mcp`），用 `stl launch` 或「开始游戏」按钮启动游戏。
+4. 安装一次 MCP 服务端依赖：运行插件目录里的 `mcp-server\install.cmd`（需要 Node.js 20+，按锁文件执行
+   `npm ci --omit=dev`）。插件不附带依赖，更新插件后需要再运行一次。
+5. 在 MCP 客户端里注册插件目录中的服务端 `mcp-server\dist\index.js`（见下文）。
 
-The plugin folder:
+插件目录：
 ```
 plugins\stellaris-mcp\
-  stl-plugin.json            manifest (game build it is made for, settings files)
+  stl-plugin.json            清单（适配的游戏版本、设置文件）
   stellaris_bridge.dll
-  defaults\stellaris_mcp.ini default settings
-  config\stellaris_mcp.ini   your settings (made from defaults\ by the launcher)
-  logs\stellaris_mcp.log     the bridge's log
-  mcp-server\                the MCP server (Node.js 20+); install.cmd installs its dependencies
+  defaults\stellaris_mcp.ini 默认设置
+  config\stellaris_mcp.ini   你的设置（启动器从 defaults\ 生成）
+  logs\stellaris_mcp.log     Bridge 日志
+  mcp-server\                MCP 服务端（Node.js 20+），install.cmd 安装其依赖
 ```
 
-### 2. Settings and log
+### 2. 设置与日志
 
-`config\stellaris_mcp.ini` holds `[log] enabled` (`true` / `false`) and `level` (`info`: start-up, errors, timeouts;
-`debug`: also every pipe request with its duration). Edit it from the launcher's Plugins page (gear button); the bridge
-re-reads it within a couple of seconds while the game runs. Without the file it uses those defaults.
+`config\stellaris_mcp.ini` 里有 `[log] enabled`（`true` / `false`）和 `level`（`info`：启动、错误、超时；`debug`：另外记录每个管道请求及耗时）。
+可在启动器插件页（齿轮按钮）编辑，游戏运行中保存后几秒内生效；文件不存在时使用上述默认值。
 
-### 3. Build from source
+### 3. 从源码构建
 
 ```powershell
 .\scripts\build.ps1                                   # -> build/stellaris_bridge/Release/stellaris_bridge.dll
 cd stellaris_mcp_server; npm install; npm run build; cd ..
-python scripts/make_plugin.py --with-deps             # -> build/plugin/stellaris-mcp (--zip <file> for a zip)
-stl plugin install build/plugin/stellaris-mcp                # the launcher's command line
+python scripts/make_plugin.py --with-deps             # -> build/plugin/stellaris-mcp（--zip <文件> 同时打包）
+stl plugin install build/plugin/stellaris-mcp                # 启动器的命令行
 ```
 
-During development the scripts in `scripts/` (`reload_dll.py`, `build_and_reload.py`) inject the freshly built DLL by
-hand; it then keeps its `config\` and `logs\` next to the build output.
+开发时可用 `scripts/` 里的 `reload_dll.py`、`build_and_reload.py` 手动把新构建的 DLL 注入正在运行的游戏；此时 `config\` 和 `logs\` 位于构建输出目录旁。
 
 ---
 
-## Client Configuration
+## 客户端配置接入
 
 ### Claude Desktop
 
-Add the following to your `claude_desktop_config.json` (located at `%APPDATA%\Claude\claude_desktop_config.json`):
+在 Claude Desktop 配置文件（路径通常为 `%APPDATA%\Claude\claude_desktop_config.json`）中添加：
 
 ```json
 {
@@ -200,7 +199,7 @@ Add the following to your `claude_desktop_config.json` (located at `%APPDATA%\Cl
     "stellaris": {
       "command": "node",
       "args": [
-        "C:\\Users\\<you>\\Documents\\Paradox Interactive\\Stellaris\\plugins\\stellaris-mcp\\mcp-server\\dist\\index.js"
+        "C:\\Users\\<你>\\Documents\\Paradox Interactive\\Stellaris\\plugins\\stellaris-mcp\\mcp-server\\dist\\index.js"
       ]
     }
   }
@@ -209,26 +208,17 @@ Add the following to your `claude_desktop_config.json` (located at `%APPDATA%\Cl
 
 ### Cursor / Antigravity
 
-In your MCP configuration:
+在 MCP 配置中添加：
 ```json
 {
   "name": "stellaris",
   "command": "node",
-  "args": ["C:/Users/<you>/Documents/Paradox Interactive/Stellaris/plugins/stellaris-mcp/mcp-server/dist/index.js"]
+  "args": ["C:/Users/<你>/Documents/Paradox Interactive/Stellaris/plugins/stellaris-mcp/mcp-server/dist/index.js"]
 }
 ```
 
 ---
 
-## Development & Reverse Engineering
+## 许可证
 
-The `scripts/` directory contains numerous standalone scripts developed during offset discovery and RTTI analysis:
-- `scripts/full_pipeline_verification.py`: End-to-end verification script testing the Named Pipe connection, status retrieval, event parsing, and command dispatch.
-- `scripts/dump_catalog.py`: Dumps available trait, tech, and building catalogs from game memory.
-- `scripts/inspect_leaders.py` / `inspect_fleets.py`: Inspects live game object pointer hierarchies.
-
----
-
-## License
-
-This project is licensed under the [MIT License](LICENSE).
+本项目基于 [MIT License](LICENSE) 开源。
